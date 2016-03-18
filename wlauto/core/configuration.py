@@ -15,14 +15,656 @@
 
 
 import os
-import json
 from copy import copy
 from collections import OrderedDict
+import logging
+import shutil
+from glob import glob
+from itertools import chain
 
 from wlauto.exceptions import ConfigError
 from wlauto.utils.misc import merge_dicts, merge_lists, load_struct_from_file
-from wlauto.utils.types import regex_type, identifier
+from wlauto.utils.types import regex_type, identifier, integer, boolean, list_of_strings
+from wlauto.core import pluginloader
+from wlauto.utils.serializer import json, WAJSONEncoder
+from wlauto.exceptions import ConfigError
+from wlauto.utils.misc import isiterable, get_article
+from wlauto.utils.serializer import read_pod, yaml
 
+
+class ConfigurationPoint(object):
+    """
+    This defines a gneric configuration point for workload automation. This is
+    used to handle global settings, plugin parameters, etc.
+
+    """
+
+    # Mapping for kind conversion; see docs for convert_types below
+    kind_map = {
+        int: integer,
+        bool: boolean,
+    }
+
+    def __init__(self, name,
+                 kind=None,
+                 mandatory=None,
+                 default=None,
+                 override=False,
+                 allowed_values=None,
+                 description=None,
+                 constraint=None,
+                 merge=False,
+                 aliases=None,
+                 convert_types=True):
+        """
+        Create a new Parameter object.
+
+        :param name: The name of the parameter. This will become an instance
+                     member of the plugin object to which the parameter is
+                     applied, so it must be a valid python  identifier. This
+                     is the only mandatory parameter.
+        :param kind: The type of parameter this is. This must be a callable
+                     that takes an arbitrary object and converts it to the
+                     expected type, or raised ``ValueError`` if such conversion
+                     is not possible. Most Python standard types -- ``str``,
+                     ``int``, ``bool``, etc. -- can be used here. This
+                     defaults to ``str`` if not specified.
+        :param mandatory: If set to ``True``, then a non-``None`` value for
+                          this parameter *must* be provided on plugin
+                          object construction, otherwise ``ConfigError``
+                          will be raised.
+        :param default: The default value for this parameter. If no value
+                        is specified on plugin construction, this value
+                        will be used instead. (Note: if this is specified
+                        and is not ``None``, then ``mandatory`` parameter
+                        will be ignored).
+        :param override: A ``bool`` that specifies whether a parameter of
+                         the same name further up the hierarchy should
+                         be overridden. If this is ``False`` (the
+                         default), an exception will be raised by the
+                         ``AttributeCollection`` instead.
+        :param allowed_values: This should be the complete list of allowed
+                               values for this parameter.  Note: ``None``
+                               value will always be allowed, even if it is
+                               not in this list.  If you want to disallow
+                               ``None``, set ``mandatory`` to ``True``.
+        :param constraint: If specified, this must be a callable that takes
+                           the parameter value as an argument and return a
+                           boolean indicating whether the constraint has been
+                           satisfied. Alternatively, can be a two-tuple with
+                           said callable as the first element and a string
+                           describing the constraint as the second.
+        :param merge: The default behaviour when setting a value on an object
+                      that already has that attribute is to overrided with
+                      the new value. If this is set to ``True`` then the two
+                      values will be merged instead. The rules by which the
+                      values are merged will be determined by the types of
+                      the existing and new values -- see
+                      ``merge_config_values`` documentation for details.
+        :param aliases: Alternative names for the same configuration point.
+                        These are largely for backwards compatibility.
+        :param convert_types: If ``True`` (the default), will automatically
+                              convert ``kind`` values from native Python
+                              types to WA equivalents. This allows more
+                              ituitive interprestation of parameter values,
+                              e.g. the string ``"false"`` being interpreted
+                              as ``False`` when specifed as the value for
+                              a boolean Parameter.
+
+        """
+        self.name = identifier(name)
+        if kind is not None and not callable(kind):
+            raise ValueError('Kind must be callable.')
+        if convert_types and kind in self.kind_map:
+            kind = self.kind_map[kind]
+        self.kind = kind
+        self.mandatory = mandatory
+        self.default = default
+        self.override = override
+        self.allowed_values = allowed_values
+        self.description = description
+        if self.kind is None and not self.override:
+            self.kind = str
+        if constraint is not None and not callable(constraint) and not isinstance(constraint, tuple):
+            raise ValueError('Constraint must be callable or a (callable, str) tuple.')
+        self.constraint = constraint
+        self.merge = merge
+        self.aliases = aliases or []
+
+    def match(self, name):
+        if name == self.name:
+            return True
+        elif name in self.aliases:
+            return True
+        return False
+
+    def set_value(self, obj, value=None):
+        if value is None:
+            if self.default is not None:
+                value = self.default
+            elif self.mandatory:
+                msg = 'No values specified for mandatory parameter {} in {}'
+                raise ConfigError(msg.format(self.name, obj.name))
+        else:
+            try:
+                value = self.kind(value)
+            except (ValueError, TypeError):
+                typename = self.get_type_name()
+                msg = 'Bad value "{}" for {}; must be {} {}'
+                article = get_article(typename)
+                raise ConfigError(msg.format(value, self.name, article, typename))
+        if self.merge and hasattr(obj, self.name):
+            value = merge_config_values(getattr(obj, self.name), value)
+        setattr(obj, self.name, value)
+
+    def validate(self, obj):
+        value = getattr(obj, self.name, None)
+
+        if value is not None:
+            if self.allowed_values:
+                self._validate_allowed_values(obj, value)
+            if self.constraint:
+                self._validate_constraint(obj, value)
+        else:
+            if self.mandatory:
+                msg = 'No value specified for mandatory parameter {} in {}.'
+                raise ConfigError(msg.format(self.name, obj.name))
+
+    def get_type_name(self):
+        typename = str(self.kind)
+        if '\'' in typename:
+            typename = typename.split('\'')[1]
+        elif typename.startswith('<function'):
+            typename = typename.split()[1]
+        return typename
+
+    def _validate_allowed_values(self, obj, value):
+        if 'list' in str(self.kind):
+            for v in value:
+                if v not in self.allowed_values:
+                    msg = 'Invalid value {} for {} in {}; must be in {}'
+                    raise ConfigError(msg.format(v, self.name, obj.name, self.allowed_values))
+        else:
+            if value not in self.allowed_values:
+                msg = 'Invalid value {} for {} in {}; must be in {}'
+                raise ConfigError(msg.format(value, self.name, obj.name, self.allowed_values))
+
+    def _validate_constraint(self, obj, value):
+        msg_vals = {'value': value, 'param': self.name, 'plugin': obj.name}
+        if isinstance(self.constraint, tuple) and len(self.constraint) == 2:
+            constraint, msg = self.constraint  # pylint: disable=unpacking-non-sequence
+        elif callable(self.constraint):
+            constraint = self.constraint
+            msg = '"{value}" failed constraint validation for {param} in {plugin}.'
+        else:
+            raise ValueError('Invalid constraint for {}: must be callable or a 2-tuple'.format(self.name))
+        if not constraint(value):
+            raise ConfigError(value, msg.format(**msg_vals))
+
+    def __repr__(self):
+        d = copy(self.__dict__)
+        del d['description']
+        return 'ConfPoint({})'.format(d)
+
+    __str__ = __repr__
+
+
+class ConfigurationPointCollection(object):
+
+    def __init__(self):
+        self._configs = []
+        self._config_map = {}
+
+    def get(self, name, default=None):
+        return self._config_map.get(name, default)
+
+    def add(self, point):
+        if not isinstance(point, ConfigurationPoint):
+            raise ValueError('Mustbe a ConfigurationPoint, got {}'.format(point.__class__))
+        existing = self.get(point.name)
+        if existing:
+            if point.override:
+                new_point = copy(existing)
+                for a, v in point.__dict__.iteritems():
+                    if v is not None:
+                        setattr(new_point, a, v)
+                self.remove(existing)
+                point = new_point
+            else:
+                raise ValueError('Duplicate ConfigurationPoint "{}"'.format(point.name))
+        self._add(point)
+
+    def remove(self, point):
+        self._configs.remove(point)
+        del self._config_map[point.name]
+        for alias in point.aliases:
+            del self._config_map[alias]
+
+    append = add
+
+    def _add(self, point):
+        self._configs.append(point)
+        self._config_map[point.name] = point
+        for alias in point.aliases:
+            if alias in self._config_map:
+                message = 'Clashing alias "{}" between "{}" and "{}"'
+                raise ValueError(message.format(alias, point.name,
+                                                self._config_map[alias].name))
+
+    def __str__(self):
+        str(self._configs)
+
+    __repr__ = __str__
+
+    def __iadd__(self, other):
+        for p in other:
+            self.add(p)
+        return self
+
+    def __iter__(self):
+        return iter(self._configs)
+
+    def __contains__(self, p):
+        if isinstance(p, basestring):
+            return p in self._config_map
+        return p.name in self._config_map
+
+    def __getitem__(self, i):
+        if isinstance(i, int):
+            return self._configs[i]
+        return self._config_map[i]
+
+    def __len__(self):
+        return len(self._configs)
+
+
+class LoggingConfig(dict):
+
+    defaults = {
+        'file_format': '%(asctime)s %(levelname)-8s %(name)s: %(message)s',
+        'verbose_format': '%(asctime)s %(levelname)-8s %(name)s: %(message)s',
+        'regular_format': '%(levelname)-8s %(message)s',
+        'color': True,
+    }
+
+    def __init__(self, config=None):
+        dict.__init__(self)
+        if isinstance(config, dict):
+            config = {identifier(k.lower()): v for k, v in config.iteritems()}
+            self['regular_format'] = config.pop('regular_format', self.defaults['regular_format'])
+            self['verbose_format'] = config.pop('verbose_format', self.defaults['verbose_format'])
+            self['file_format'] = config.pop('file_format', self.defaults['file_format'])
+            self['color'] = config.pop('colour_enabled', self.defaults['color'])  # legacy
+            self['color'] = config.pop('color', self.defaults['color'])
+            if config:
+                message = 'Unexpected logging configuation parameters: {}'
+                raise ValueError(message.format(bad_vals=', '.join(config.keys())))
+        elif config is None:
+            for k, v in self.defaults.iteritems():
+                self[k] = v
+        else:
+            raise ValueError(config)
+
+
+__WA_CONFIGURATION = [
+    ConfigurationPoint(
+        'user_directory',
+        description="""
+        Path to the user directory. This is the location WA will look for
+        user configuration, additional plugins and plugin dependencies.
+        """,
+        kind=str,
+        default=os.path.join(os.path.expanduser('~'), '.workload_automation'),
+    ),
+    ConfigurationPoint(
+        'plugin_packages',
+        kind=list_of_strings,
+        default=[
+            'wlauto.commands',
+            'wlauto.workloads',
+            'wlauto.instrumentation',
+            'wlauto.result_processors',
+            'wlauto.managers',
+            'wlauto.resource_getters',
+        ],
+        description="""
+        List of packages that will be scanned for WA plugins.
+        """,
+    ),
+    ConfigurationPoint(
+        'plugin_paths',
+        kind=list_of_strings,
+        default=[
+            'workloads',
+            'instruments',
+            'targets',
+            'processors',
+
+            # Legacy
+            'managers',
+            'result_processors',
+        ],
+        description="""
+        List of paths that will be scanned for WA plugins.
+        """,
+    ),
+    ConfigurationPoint(
+        'plugin_ignore_paths',
+        kind=list_of_strings,
+        default=[],
+        description="""
+        List of (sub)paths that will be ignored when scanning
+        ``plugin_paths`` for WA plugins.
+        """,
+    ),
+    ConfigurationPoint(
+        'assets_repository',
+        description="""
+        The local mount point for the filer hosting WA assets.
+        """,
+    ),
+    ConfigurationPoint(
+        'logging',
+        kind=LoggingConfig,
+        default=LoggingConfig.defaults,
+        description="""
+        WA logging configuration. This should be a dict with a subset
+        of the following keys::
+
+        :normal_format: Logging format used for console output
+        :verbose_format: Logging format used for verbose console output
+        :file_format: Logging format used for run.log
+        :color: If ``True`` (the default), console logging output will
+                contain bash color escape codes. Set this to ``False`` if
+                console output will be piped somewhere that does not know
+                how to handle those.
+        """,
+    ),
+    ConfigurationPoint(
+        'verbosity',
+        kind=int,
+        default=0,
+        description="""
+        Verbosity of console output.
+        """,
+    ),
+    ConfigurationPoint(
+        'default_output_directory',
+        default="wa_output",
+        description="""
+        The default output directory that will be created if not
+        specified when invoking a run.
+        """,
+    ),
+]
+
+WA_CONFIGURATION = {cp.name: cp for cp in __WA_CONFIGURATION}
+
+ENVIRONMENT_VARIABLES = {
+    'WA_USER_DIRECTORY': WA_CONFIGURATION['user_directory'],
+    'WA_PLUGIN_PATHS': WA_CONFIGURATION['plugin_paths'],
+    'WA_EXTENSION_PATHS': WA_CONFIGURATION['plugin_paths'],  # plugin_paths (legacy)
+}
+
+
+class WAConfiguration(object):
+    """
+    This is configuration for Workload Automation framework as a whole. This
+    does not track configuration for WA runs. Rather, this tracks "meta"
+    configuration, such as various locations WA looks for things, logging
+    configuration etc.
+
+    """
+
+    basename = 'config'
+
+    @property
+    def dependencies_directory(self):
+        return os.path.join(self.user_directory, 'dependencies')
+
+    def __init__(self):
+        self.user_directory = ''
+        self.plugin_packages = []
+        self.plugin_paths = []
+        self.plugin_ignore_paths = []
+        self.config_paths = []
+        self.logging = {}
+        self._logger = logging.getLogger('settings')
+        for confpoint in WA_CONFIGURATION.itervalues():
+            confpoint.set_value(self)
+
+    def load_environment(self):
+        for name, confpoint in ENVIRONMENT_VARIABLES.iteritems():
+            value = os.getenv(name)
+            if value:
+                confpoint.set_value(self, value)
+        self._expand_paths()
+
+    def load_config_file(self, path):
+        self.load(read_pod(path))
+        if path not in self.config_paths:
+            self.config_paths.append(path)
+
+    def load_user_config(self):
+        globpath = os.path.join(self.user_directory, '{}.*'.format(self.basename))
+        for path in glob(globpath):
+            ext = os.path.splitext(path)[1].lower()
+            if ext in ['.pyc', '.pyo', '.py~']:
+                continue
+            self.load_config_file(path)
+
+    def load(self, config):
+        for name, value in config.iteritems():
+            if name in WA_CONFIGURATION:
+                confpoint = WA_CONFIGURATION[name]
+                confpoint.set_value(self, value)
+        self._expand_paths()
+
+    def set(self, name, value):
+        if name not in WA_CONFIGURATION:
+            raise ConfigError('Unknown WA configuration "{}"'.format(name))
+        WA_CONFIGURATION[name].set_value(self, value)
+
+    def initialize_user_directory(self, overwrite=False):
+        """
+        Initialize a fresh user environment creating the workload automation.
+
+        """
+        if os.path.exists(self.user_directory):
+            if not overwrite:
+                raise ConfigError('Environment {} already exists.'.format(self.user_directory))
+            shutil.rmtree(self.user_directory)
+
+        self._expand_paths()
+        os.makedirs(self.dependencies_directory)
+        for path in self.plugin_paths:
+            os.makedirs(path)
+
+        with open(os.path.join(self.user_directory, 'config.yaml'), 'w') as _:
+            yaml.dump(self.to_pod())
+
+        if os.getenv('USER') == 'root':
+            # If running with sudo on POSIX, change the ownership to the real user.
+            real_user = os.getenv('SUDO_USER')
+            if real_user:
+                import pwd  # done here as module won't import on win32
+                user_entry = pwd.getpwnam(real_user)
+                uid, gid = user_entry.pw_uid, user_entry.pw_gid
+                os.chown(self.user_directory, uid, gid)
+                # why, oh why isn't there a recusive=True option for os.chown?
+                for root, dirs, files in os.walk(self.user_directory):
+                    for d in dirs:
+                        os.chown(os.path.join(root, d), uid, gid)
+                    for f in files:
+                        os.chown(os.path.join(root, f), uid, gid)
+
+    @staticmethod
+    def from_pod(pod):
+        instance = WAConfiguration()
+        instance.load(pod)
+        return instance
+
+    def to_pod(self):
+        return dict(
+            user_directory=self.user_directory,
+            plugin_packages=self.plugin_packages,
+            plugin_paths=self.plugin_paths,
+            plugin_ignore_paths=self.plugin_ignore_paths,
+            logging=self.logging,
+        )
+
+    def _expand_paths(self):
+        expanded = []
+        for path in self.plugin_paths:
+            path = os.path.expanduser(path)
+            path = os.path.expandvars(path)
+            expanded.append(os.path.join(self.user_directory, path))
+        self.plugin_paths = expanded
+        expanded = []
+        for path in self.plugin_ignore_paths:
+            path = os.path.expanduser(path)
+            path = os.path.expandvars(path)
+            expanded.append(os.path.join(self.user_directory, path))
+        self.plugin_ignore_paths = expanded
+
+
+class PluginConfiguration(object):
+    """ Maintains a mapping of plugin_name --> plugin_config. """
+
+    def __init__(self, loader=pluginloader):
+        self.loader = loader
+        self.config = {}
+
+    def update(self, name, config):
+        if not hasattr(config, 'get'):
+            raise ValueError('config must be a dict-like object got: {}'.format(config))
+        name, alias_config = self.loader.resolve_alias(name)
+        existing_config = self.config.get(name)
+        if existing_config is None:
+            existing_config = alias_config
+
+        new_config = config or {}
+        self.config[name] = merge_config_values(existing_config, new_config)
+
+
+def merge_config_values(base, other):
+    """
+    This is used to merge two objects, typically when setting the value of a
+    ``ConfigurationPoint``. First, both objects are categorized into
+
+        c: A scalar value. Basically, most objects. These values
+           are treated as atomic, and not mergeable.
+        s: A sequence. Anything iterable that is not a dict or
+           a string (strings are considered scalars).
+        m: A key-value mapping. ``dict`` and it's derivatives.
+        n: ``None``.
+        o: A mergeable object; this is an object that implements both
+          ``merge_with`` and ``merge_into`` methods.
+
+    The merge rules based on the two categories are then as follows:
+
+        (c1, c2) --> c2
+        (s1, s2) --> s1 . s2
+        (m1, m2) --> m1 . m2
+        (c, s) --> [c] . s
+        (s, c) --> s . [c]
+        (s, m) --> s . [m]
+        (m, s) --> [m] . s
+        (m, c) --> ERROR
+        (c, m) --> ERROR
+        (o, X) --> o.merge_with(X)
+        (X, o) --> o.merge_into(X)
+        (X, n) --> X
+        (n, X) --> X
+
+    where:
+
+        '.'  means concatenation (for maps, contcationation of (k, v) streams
+             then converted back into a map). If the types of the two objects
+             differ, the type of ``other`` is used for the result.
+        'X'  means "any category"
+        '[]' used to indicate a literal sequence (not necessarily a ``list``).
+             when this is concatenated with an actual sequence, that sequencies
+             type is used.
+
+    notes:
+
+        - When a mapping is combined with a sequence, that mapping is
+          treated as a scalar value.
+        - When combining two mergeable objects, they're combined using
+          ``o1.merge_with(o2)`` (_not_ using o2.merge_into(o1)).
+        - Combining anything with ``None`` yields that value, irrespective
+          of the order. So a ``None`` value is eqivalent to the corresponding
+          item being omitted.
+        - When both values are scalars, merging is equivalent to overwriting.
+        - There is no recursion (e.g. if map values are lists, they will not
+          be merged; ``other`` will overwrite ``base`` values). If complicated
+          merging semantics (such as recursion) are required, they should be
+          implemented within custom mergeable types (i.e. those that implement
+          ``merge_with`` and ``merge_into``).
+
+    While this can be used as a generic "combine any two arbitry objects"
+    function, the semantics have been selected specifically for merging
+    configuration point values.
+
+    """
+    cat_base = categorize(base)
+    cat_other = categorize(other)
+
+    if cat_base == 'n':
+        return other
+    elif cat_other == 'n':
+        return base
+
+    if cat_base == 'o':
+        return base.merge_with(other)
+    elif cat_other == 'o':
+        return other.merge_into(base)
+
+    if cat_base == 'm':
+        if cat_other == 's':
+            return merge_sequencies([base], other)
+        elif cat_other == 'm':
+            return merge_maps(base, other)
+        else:
+            message = 'merge error ({}, {}): "{}" and "{}"'
+            raise ValueError(message.format(cat_base, cat_other, base, other))
+    elif cat_base == 's':
+        if cat_other == 's':
+            return merge_sequencies(base, other)
+        else:
+            return merge_sequencies(base, [other])
+    else:  # cat_base == 'c'
+        if cat_other == 's':
+            return merge_sequencies([base], other)
+        elif cat_other == 'm':
+            message = 'merge error ({}, {}): "{}" and "{}"'
+            raise ValueError(message.format(cat_base, cat_other, base, other))
+        else:
+            return other
+
+
+def merge_sequencies(s1, s2):
+    return type(s2)(chain(s1, s2))
+
+
+def merge_maps(m1, m2):
+    return type(m2)(chain(m1.iteritems(), m2.iteritems()))
+
+
+def categorize(v):
+    if hasattr(v, 'merge_with') and hasattr(v, 'merge_into'):
+        return 'o'
+    elif hasattr(v, 'iteritems'):
+        return 'm'
+    elif isiterable(v):
+        return 's'
+    elif v is None:
+        return 'n'
+    else:
+        return 'c'
+
+settings = WAConfiguration()
 
 class SharedConfiguration(object):
 
@@ -34,21 +676,6 @@ class SharedConfiguration(object):
         self.runtime_parameters = OrderedDict()
         self.workload_parameters = OrderedDict()
         self.instrumentation = []
-
-
-class ConfigurationJSONEncoder(json.JSONEncoder):
-
-    def default(self, obj):  # pylint: disable=E0202
-        if isinstance(obj, WorkloadRunSpec):
-            return obj.to_dict()
-        elif isinstance(obj, RunConfiguration):
-            return obj.to_dict()
-        elif isinstance(obj, RebootPolicy):
-            return obj.policy
-        elif isinstance(obj, regex_type):
-            return obj.pattern
-        else:
-            return json.JSONEncoder.default(self, obj)
 
 
 class WorkloadRunSpec(object):
@@ -151,11 +778,27 @@ class WorkloadRunSpec(object):
         This must be done before attempting to execute the spec."""
         self._workload = ext_loader.get_workload(self.workload_name, device, **self.workload_parameters)
 
-    def to_dict(self):
+    def to_pod(self):
         d = copy(self.__dict__)
         del d['_workload']
         del d['_section']
         return d
+
+    @staticmethod
+    def from_pod(pod):
+        instance = WorkloadRunSpec(id=pod['id'],  # pylint: disable=W0622
+                                   number_of_iterations=pod['number_of_iterations'],
+                                   workload_name=pod['workload_name'],
+                                   boot_parameters=pod['boot_parameters'],
+                                   label=pod['label'],
+                                   section_id=pod['section_id'],
+                                   workload_parameters=pod['workload_parameters'],
+                                   runtime_parameters=pod['runtime_parameters'],
+                                   instrumentation=pod['instrumentation'],
+                                   flash=pod['flash'],
+                                   classifiers=pod['classifiers'],
+                                   )
+        return instance
 
     def copy(self):
         other = WorkloadRunSpec()
@@ -313,6 +956,11 @@ class RunConfigurationItem(object):
 
         return value
 
+    def __str__(self):
+        return "RCI(name: {}, category: {}, method: {})".format(self.name, self.category, self.method)
+
+    __repr__ = __str__
+
 
 def _combine_ids(*args):
     return '_'.join(args)
@@ -334,8 +982,8 @@ class RunConfiguration(object):
     the implementation gets rather complicated. This is going to be a quick overview of
     the underlying mechanics.
 
-    .. note:: You don't need to know this to use WA, or to write extensions for it. From
-              the point of view of extension writers, configuration from various sources
+    .. note:: You don't need to know this to use WA, or to write plugins for it. From
+              the point of view of plugin writers, configuration from various sources
               "magically" appears as attributes of their classes. This explanation peels
               back the curtain and is intended for those who, for one reason or another,
               need to understand how the magic works.
@@ -353,7 +1001,7 @@ class RunConfiguration(object):
     config(uration) item
 
         A single configuration entry or "setting", e.g. the device interface to use. These
-        can be for the run as a whole, or for a specific extension.
+        can be for the run as a whole, or for a specific plugin.
 
     (workload) spec
 
@@ -366,7 +1014,7 @@ class RunConfiguration(object):
     There are three types of WA configuration:
 
         1. "Meta" configuration that determines how the rest of the configuration is
-           processed (e.g. where extensions get loaded from). Since this does not pertain
+           processed (e.g. where plugins get loaded from). Since this does not pertain
            to *run* configuration, it will not be covered further.
         2. Global run configuration, e.g. which workloads, result processors and instruments
            will be enabled for a run.
@@ -379,16 +1027,16 @@ class RunConfiguration(object):
     Run configuration may appear in a config file (usually ``~/.workload_automation/config.py``),
     or in the ``config`` section of an agenda. Configuration is specified as a nested structure
     of dictionaries (associative arrays, or maps) and lists in the syntax following the format
-    implied by the file extension (currently, YAML and Python are supported). If the same
+    implied by the file plugin (currently, YAML and Python are supported). If the same
     configuration item appears in more than one source, they are merged with conflicting entries
     taking the value from the last source that specified them.
 
     In addition to a fixed set of global configuration items, configuration for any WA
-    Extension (instrument, result processor, etc) may also be specified, namespaced under
-    the extension's name (i.e. the extensions name is a key in the global config with value
-    being a dict of parameters and their values). Some Extension parameters also specify a
+    Plugin (instrument, result processor, etc) may also be specified, namespaced under
+    the plugin's name (i.e. the plugins name is a key in the global config with value
+    being a dict of parameters and their values). Some Plugin parameters also specify a
     "global alias" that may appear at the top-level of the config rather than under the
-    Extension's name. It is *not* an error to specify configuration for an Extension that has
+    Plugin's name. It is *not* an error to specify configuration for an Plugin that has
     not been enabled for a particular run; such configuration will be ignored.
 
 
@@ -408,11 +1056,11 @@ class RunConfiguration(object):
 
     **Global parameter aliases**
 
-    As mentioned above, an Extension's parameter may define a global alias, which will be
+    As mentioned above, an Plugin's parameter may define a global alias, which will be
     specified and picked up from the top-level config, rather than config for that specific
-    extension. It is an error to specify the value for a parameter both through a global
-    alias and through extension config dict in the same configuration file. It is, however,
-    possible to use a global alias in one file, and specify extension configuration for the
+    plugin. It is an error to specify the value for a parameter both through a global
+    alias and through plugin config dict in the same configuration file. It is, however,
+    possible to use a global alias in one file, and specify plugin configuration for the
     same parameter in another file, in which case, the usual merging rules would apply.
 
     **Loading and validation of configuration**
@@ -425,50 +1073,50 @@ class RunConfiguration(object):
       This is done by the loading mechanism (e.g. YAML parser), rather than WA itself. WA
       propagates any errors encountered as ``ConfigError``\ s.
     - Once a config file is loaded into a Python structure, it scanned to
-      extract settings. Static configuration is validated and added to the config. Extension
+      extract settings. Static configuration is validated and added to the config. Plugin
       configuration is collected into a collection of "raw" config, and merged as appropriate, but
       is not processed further at this stage.
     - Once all configuration sources have been processed, the configuration as a whole
       is validated (to make sure there are no missing settings, etc).
-    - Extensions are loaded through the run config object, which instantiates
+    - Plugins are loaded through the run config object, which instantiates
       them with appropriate parameters based on the "raw" config collected earlier. When an
-      Extension is instantiated in such a way, its config is "officially" added to run configuration
+      Plugin is instantiated in such a way, its config is "officially" added to run configuration
       tracked by the run config object. Raw config is discarded at the end of the run, so
       that any config that wasn't loaded in this way is not recoded (as it was not actually used).
-    - Extension parameters a validated individually (for type, value ranges, etc) as they are
-      loaded in the Extension's __init__.
-    - An extension's ``validate()`` method is invoked before it is used (exactly when this
-      happens depends on the extension's type) to perform any final validation *that does not
+    - Plugin parameters a validated individually (for type, value ranges, etc) as they are
+      loaded in the Plugin's __init__.
+    - An plugin's ``validate()`` method is invoked before it is used (exactly when this
+      happens depends on the plugin's type) to perform any final validation *that does not
       rely on the target being present* (i.e. this would happen before WA connects to the target).
-      This can be used perform inter-parameter validation for an extension (e.g. when valid range for
+      This can be used perform inter-parameter validation for an plugin (e.g. when valid range for
       one parameter depends on another), and more general WA state assumptions (e.g. a result
       processor can check that an instrument it depends on has been installed).
-    - Finally, it is the responsibility of individual extensions to validate any assumptions
+    - Finally, it is the responsibility of individual plugins to validate any assumptions
       they make about the target device (usually as part of their ``setup()``).
 
-    **Handling of Extension aliases.**
+    **Handling of Plugin aliases.**
 
-    WA extensions can have zero or more aliases (not to be confused with global aliases for extension
-    *parameters*). An extension allows associating an alternative name for the extension with a set
-    of parameter values. In other words aliases associate common configurations for an extension with
+    WA plugins can have zero or more aliases (not to be confused with global aliases for plugin
+    *parameters*). An plugin allows associating an alternative name for the plugin with a set
+    of parameter values. In other words aliases associate common configurations for an plugin with
     a name, providing a shorthand for it. For example, "t-rex_offscreen" is an alias for "glbenchmark"
     workload that specifies that "use_case" should be "t-rex" and "variant" should be "offscreen".
 
     **special loading rules**
 
-    Note that as a consequence of being able to specify configuration for *any* Extension namespaced
-    under the Extension's name in the top-level config, two distinct mechanisms exist form configuring
+    Note that as a consequence of being able to specify configuration for *any* Plugin namespaced
+    under the Plugin's name in the top-level config, two distinct mechanisms exist form configuring
     devices and workloads. This is valid, however due to their nature, they are handled in a special way.
     This may be counter intuitive, so configuration of devices and workloads creating entries for their
     names in the config is discouraged in favour of using the "normal" mechanisms of configuring them
     (``device_config`` for devices and workload specs in the agenda for workloads).
 
-    In both cases (devices and workloads), "normal" config will always override named extension config
+    In both cases (devices and workloads), "normal" config will always override named plugin config
     *irrespective of which file it was specified in*. So a ``adb_name`` name specified in ``device_config``
     inside ``~/.workload_automation/config.py`` will override ``adb_name`` specified for ``juno`` in the
     agenda (even when device is set to "juno").
 
-    Again, this ignores normal loading rules, so the use of named extension configuration for devices
+    Again, this ignores normal loading rules, so the use of named plugin configuration for devices
     and workloads is discouraged. There maybe some situations where this behaviour is useful however
     (e.g. maintaining configuration for different devices in one config file).
 
@@ -480,6 +1128,8 @@ class RunConfiguration(object):
     # This is generic top-level configuration.
     general_config = [
         RunConfigurationItem('run_name', 'scalar', 'replace'),
+        RunConfigurationItem('output_directory', 'scalar', 'replace'),
+        RunConfigurationItem('meta_directory', 'scalar', 'replace'),
         RunConfigurationItem('project', 'scalar', 'replace'),
         RunConfigurationItem('project_stage', 'dict', 'replace'),
         RunConfigurationItem('execution_order', 'scalar', 'replace'),
@@ -507,7 +1157,7 @@ class RunConfiguration(object):
 
     # List of names that may be present in configuration (and it is valid for
     # them to be there) but are not handled buy RunConfiguration.
-    ignore_names = ['logging', 'remote_assets_mount_point']
+    ignore_names = WA_CONFIGURATION.keys()
 
     def get_reboot_policy(self):
         if not self._reboot_policy:
@@ -523,13 +1173,25 @@ class RunConfiguration(object):
     reboot_policy = property(get_reboot_policy, set_reboot_policy)
 
     @property
+    def meta_directory(self):
+        path = os.path.join(self.output_directory, "__meta")
+        if not os.path.exists(path):
+            os.makedirs(os.path.abspath(path))
+        return path
+
+    @property
+    def log_file(self):
+        path = os.path.join(self.output_directory, "run.log")
+        return os.path.abspath(path)
+
+    @property
     def all_instrumentation(self):
         result = set()
         for spec in self.workload_specs:
             result = result.union(set(spec.instrumentation))
         return result
 
-    def __init__(self, ext_loader):
+    def __init__(self, ext_loader=pluginloader):
         self.ext_loader = ext_loader
         self.device = None
         self.device_config = None
@@ -537,40 +1199,42 @@ class RunConfiguration(object):
         self.project = None
         self.project_stage = None
         self.run_name = None
+        self.output_directory = settings.default_output_directory
         self.instrumentation = {}
         self.result_processors = {}
         self.workload_specs = []
         self.flashing_config = {}
-        self.other_config = {}  # keeps track of used config for extensions other than of the four main kinds.
+        self.other_config = {}  # keeps track of used config for plugins other than of the four main kinds.
         self.retry_on_status = status_list(['FAILED', 'PARTIAL'])
         self.max_retries = 3
         self._used_config_items = []
         self._global_instrumentation = []
         self._reboot_policy = None
-        self._agenda = None
+        self.agenda = None
         self._finalized = False
         self._general_config_map = {i.name: i for i in self.general_config}
         self._workload_config_map = {i.name: i for i in self.workload_config}
-        # Config files may contains static configuration for extensions that
+        # Config files may contains static configuration for plugins that
         # would not be part of this of this run (e.g. DB connection settings
         # for a result processor that has not been enabled). Such settings
         # should not be part of configuration for this run (as they will not
         # be affecting it), but we still need to keep track it in case a later
-        # config (e.g. from the agenda) enables the extension.
-        # For this reason, all extension config is first loaded into the
-        # following dict and when an extension is identified as need for the
+        # config (e.g. from the agenda) enables the plugin.
+        # For this reason, all plugin config is first loaded into the
+        # following dict and when an plugin is identified as need for the
         # run, its config is picked up from this "raw" dict and it becomes part
         # of the run configuration.
         self._raw_config = {'instrumentation': [], 'result_processors': []}
 
-    def get_extension(self, ext_name, *args):
+    def get_plugin(self, name=None, kind=None, *args, **kwargs):
         self._check_finalized()
-        self._load_default_config_if_necessary(ext_name)
-        ext_config = self._raw_config[ext_name]
-        ext_cls = self.ext_loader.get_extension_class(ext_name)
+        self._load_default_config_if_necessary(name)
+        ext_config = self._raw_config[name]
+        ext_cls = self.ext_loader.get_plugin_class(name)
         if ext_cls.kind not in ['workload', 'device', 'instrument', 'result_processor']:
-            self.other_config[ext_name] = ext_config
-        return self.ext_loader.get_extension(ext_name, *args, **ext_config)
+            self.other_config[name] = ext_config
+        ext_config.update(kwargs)
+        return self.ext_loader.get_plugin(name=name, *args, **ext_config)
 
     def to_dict(self):
         d = copy(self.__dict__)
@@ -584,8 +1248,8 @@ class RunConfiguration(object):
     def load_config(self, source):
         """Load configuration from the specified source. The source must be
         either a path to a valid config file or a dict-like object. Currently,
-        config files can be either python modules (.py extension) or YAML documents
-        (.yaml extension)."""
+        config files can be either python modules (.py plugin) or YAML documents
+        (.yaml plugin)."""
         if self._finalized:
             raise ValueError('Attempting to load a config file after run configuration has been finalized.')
         try:
@@ -597,15 +1261,15 @@ class RunConfiguration(object):
 
     def set_agenda(self, agenda, selectors=None):
         """Set the agenda for this run; Unlike with config files, there can only be one agenda."""
-        if self._agenda:
+        if self.agenda:
             # note: this also guards against loading an agenda after finalized() has been called,
             #       as that would have required an agenda to be set.
             message = 'Attempting to set a second agenda {};\n\talready have agenda {} set'
-            raise ValueError(message.format(agenda.filepath, self._agenda.filepath))
+            raise ValueError(message.format(agenda.filepath, self.agenda.filepath))
         try:
             self._merge_config(agenda.config or {})
             self._load_specs_from_agenda(agenda, selectors)
-            self._agenda = agenda
+            self.agenda = agenda
         except ConfigError as e:
             message = 'Error in {}:\n\t{}'
             raise ConfigError(message.format(agenda.filepath, e.message))
@@ -616,7 +1280,7 @@ class RunConfiguration(object):
         for the run And making sure that all the mandatory config has been specified."""
         if self._finalized:
             return
-        if not self._agenda:
+        if not self.agenda:
             raise ValueError('Attempting to finalize run configuration before an agenda is loaded.')
         self._finalize_config_list('instrumentation')
         self._finalize_config_list('result_processors')
@@ -635,9 +1299,6 @@ class RunConfiguration(object):
             spec.validate()
         self._finalized = True
 
-    def serialize(self, wfh):
-        json.dump(self, wfh, cls=ConfigurationJSONEncoder, indent=4)
-
     def _merge_config(self, config):
         """
         Merge the settings specified by the ``config`` dict-like object into current
@@ -653,8 +1314,8 @@ class RunConfiguration(object):
                 self._resolve_global_alias(k, v)
             elif k in self._general_config_map:
                 self._set_run_config_item(k, v)
-            elif self.ext_loader.has_extension(k):
-                self._set_extension_config(k, v)
+            elif self.ext_loader.has_plugin(k):
+                self._set_plugin_config(k, v)
             elif k == 'device_config':
                 self._set_raw_dict(k, v)
             elif k in ['instrumentation', 'result_processors']:
@@ -683,7 +1344,7 @@ class RunConfiguration(object):
         combined_value = item.combine(getattr(self, name, None), value)
         setattr(self, name, combined_value)
 
-    def _set_extension_config(self, name, value):
+    def _set_plugin_config(self, name, value):
         default_config = self.ext_loader.get_default_config(name)
         self._set_raw_dict(name, value, default_config)
 
@@ -772,6 +1433,49 @@ class RunConfiguration(object):
         if not self._finalized:
             raise ValueError('Attempting to access configuration before it has been finalized.')
 
+    @staticmethod
+    def from_pod(pod, ext_loader=pluginloader):
+        instance = RunConfiguration
+        self.device = pod['device']
+        self.execution_order = pod['execution_order']
+        self.project = pod['project']
+        self.project_stage = pod['project_stage']
+        self.run_name = pod['run_name']
+        self.max_retries = pod['max_retries']
+        self._reboot_policy.policy = RebootPolicy.from_pod(pod['_reboot_policy'])
+        self.output_directory = pod['output_directory']
+        self.device_config = pod['device_config']
+        self.instrumentation = pod['instrumentation']
+        self.result_processors = pod['result_processors']
+        self.workload_specs = [WorkloadRunSpec.from_pod(pod) for pod in pod['workload_specs']]
+        self.flashing_config = pod['flashing_config']
+        self.other_config = pod['other_config']
+        self.retry_on_status = pod['retry_on_status']
+        self._used_config_items = pod['_used_config_items']
+        self._global_instrumentation = pod['_global_instrumentation']
+
+    def to_pod(self):
+        if not self._finalized:
+            raise Exception("Cannot use `to_pod` until the config is finalis")
+        pod = {}
+        pod['device'] = self.device
+        pod['execution_order'] = self.execution_order
+        pod['project'] = self.project
+        pod['project_stage'] = self.project_stage
+        pod['run_name'] = self.run_name
+        pod['max_retries'] = self.max_retries
+        pod['_reboot_policy'] = self._reboot_policy.to_pod()
+        pod['output_directory'] = os.path.abspath(self.output_directory)
+        pod['device_config'] = self.device_config
+        pod['instrumentation'] = self.instrumentation
+        pod['result_processors'] = self.result_processors
+        pod['workload_specs'] = [w.to_pod() for w in self.workload_specs]
+        pod['flashing_config'] = self.flashing_config
+        pod['other_config'] = self.other_config
+        pod['retry_on_status'] = self.retry_on_status
+        pod['_used_config_items'] = self._used_config_items
+        pod['_global_instrumentation'] = self._global_instrumentation
+        return pod
 
 def _load_raw_struct(source):
     """Load a raw dict config structure from the specified source."""
